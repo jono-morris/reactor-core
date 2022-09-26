@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2018-2021 VMware Inc. or its affiliates, All Rights Reserved.
+ * Copyright (c) 2018-2022 VMware Inc. or its affiliates, All Rights Reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -18,7 +18,10 @@ package reactor.core.publisher;
 
 import java.util.Arrays;
 import java.util.Comparator;
+import java.util.LinkedList;
+import java.util.List;
 import java.util.Objects;
+import java.util.PriorityQueue;
 import java.util.Queue;
 import java.util.concurrent.atomic.AtomicIntegerFieldUpdater;
 import java.util.concurrent.atomic.AtomicLongFieldUpdater;
@@ -132,6 +135,12 @@ final class FluxMergeComparing<T> extends Flux<T> implements SourceProducer<T> {
 
 		boolean done;
 
+		volatile int innerDoneCount = 0;
+				
+		Comparator<MergeOrderedInnerSubscriber<T>> heapComparator;
+		Queue<MergeOrderedInnerSubscriber<T>> innerSubscriberQueue;	
+		Queue<MergeOrderedInnerSubscriber<T>> activeInnerSubscribers = new LinkedList<>();
+		
 		volatile Throwable error;
 		static final AtomicReferenceFieldUpdater<MergeOrderedMainProducer, Throwable> ERROR =
 				AtomicReferenceFieldUpdater.newUpdater(MergeOrderedMainProducer.class, Throwable.class, "error");
@@ -164,8 +173,14 @@ final class FluxMergeComparing<T> extends Flux<T> implements SourceProducer<T> {
 					new MergeOrderedInnerSubscriber[n];
 			this.subscribers = mergeOrderedInnerSub;
 
+			heapComparator = 
+					(MergeOrderedInnerSubscriber<T> m1, MergeOrderedInnerSubscriber<T> m2) -> 
+							this.comparator.compare(m1.queue.peek(), m2.queue.peek());	
+			innerSubscriberQueue = new PriorityQueue<>(n, heapComparator);
+			
 			for (int i = 0; i < n; i++) {
 				this.subscribers[i] = new MergeOrderedInnerSubscriber<>(this, prefetch);
+				activeInnerSubscribers.add(this.subscribers[i]);
 			}
 			this.values = new Object[n];
 		}
@@ -232,12 +247,8 @@ final class FluxMergeComparing<T> extends Flux<T> implements SourceProducer<T> {
 
 			int missed = 1;
 			CoreSubscriber<? super T> actual = this.actual;
-			Comparator<? super T> comparator = this.comparator;
 
-			MergeOrderedInnerSubscriber<T>[] subscribers = this.subscribers;
 			int n = subscribers.length;
-
-			Object[] values = this.values;
 
 			long e = emitted;
 
@@ -247,81 +258,53 @@ final class FluxMergeComparing<T> extends Flux<T> implements SourceProducer<T> {
 				for (;;) {
 					boolean d = this.done;
 					if (cancelled != 0) {
-						Arrays.fill(values, null);
-
 						for (MergeOrderedInnerSubscriber<T> inner : subscribers) {
 							inner.queue.clear();
 						}
 						return;
 					}
 
-					int innerDoneCount = 0;
-					int nonEmpty = 0;
-					for (int i = 0; i < n; i++) {
-						Object o = values[i];
-						if (o == DONE) {
-							innerDoneCount++;
-							nonEmpty++;
-						}
-						else if (o == null) {
-							boolean innerDone = subscribers[i].done;
-							o = subscribers[i].queue.poll();
-							if (o != null) {
-								values[i] = o;
-								nonEmpty++;
-							}
-							else if (innerDone) {
-								values[i] = DONE;
-								innerDoneCount++;
-								nonEmpty++;
-							}
-						}
-						else {
-							nonEmpty++;
-						}
-					}
-
-					if (checkTerminated(d || innerDoneCount == n, actual)) {
-						return;
-					}
-
-					if (nonEmpty != n || e >= r) {
-						break;
-					}
-
-					T min = null;
-					int minIndex = -1;
-
-					int i = 0;
-					for (Object o : values) {
-						if (o != DONE) {
-							boolean smaller;
+					int subscriberCount = this.activeInnerSubscribers.size();
+					int nonEmpty = this.innerSubscriberQueue.size() + this.innerDoneCount;
+					while (subscriberCount > 0) {
+						MergeOrderedInnerSubscriber<T> innerSubscriber = this.activeInnerSubscribers.poll();
+						if(null != innerSubscriber.queue.peek()) {
 							try {
-								@SuppressWarnings("unchecked")
-								T t = (T) o;
-								smaller = min == null || comparator.compare(min, t) > 0;
+								this.innerSubscriberQueue.add(innerSubscriber);
 							} catch (Throwable ex) {
 								Exceptions.addThrowable(ERROR, this, ex);
 								cancel();
 								actual.onError(Exceptions.terminate(ERROR, this));
-								return;
+								return;								
 							}
-							if (smaller) {
-								@SuppressWarnings("unchecked")
-								T t = (T) o;
-								min = t;
-								minIndex = i;
-							}
+							nonEmpty++;
 						}
-						i++;
+						else if (innerSubscriber.done) {
+							this.innerDoneCount++;
+							nonEmpty++;
+						}
+						else {
+							this.activeInnerSubscribers.add(innerSubscriber);
+						}
+						subscriberCount--;
 					}
 
-					values[minIndex] = null;
+					if (checkTerminated(d || this.innerDoneCount == n, actual)) {
+						return;
+					}
 
+ 					if (nonEmpty != n || e >= r) {
+						break;
+					}
+
+					MergeOrderedInnerSubscriber<T> subscriber = innerSubscriberQueue.poll();
+					T min = subscriber.queue.poll();
+					System.out.println(min);
 					actual.onNext(min);
 
 					e++;
-					subscribers[minIndex].request(1);
+					subscriber.request(1);
+					activeInnerSubscribers.add(subscriber);
 				}
 
 				this.emitted = e;
